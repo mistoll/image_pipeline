@@ -54,13 +54,11 @@ class ResizeNodelet : public nodelet::Nodelet
 {
 protected:
   // ROS communication
-  image_transport::Publisher pub_image_;
+  image_transport::CameraPublisher pub_image_;
   image_transport::CameraSubscriber sub_image_;
-  ros::Publisher pub_info_;
-  ros::Subscriber sub_info_;
   int queue_size_;
 
-  boost::shared_ptr<image_transport::ImageTransport> it_;
+  boost::shared_ptr<image_transport::ImageTransport> it_, private_it_;
   boost::mutex connect_mutex_;
 
   // Dynamic reconfigure
@@ -84,7 +82,8 @@ void ResizeNodelet::onInit()
 {
   ros::NodeHandle &nh         = getNodeHandle();
   ros::NodeHandle &private_nh = getPrivateNodeHandle();
-  it_.reset(new image_transport::ImageTransport(private_nh));
+  it_.reset(new image_transport::ImageTransport(nh));
+  private_it_.reset(new image_transport::ImageTransport(private_nh));
 
   // Set up dynamic reconfigure
   reconfigure_server_.reset(new ReconfigureServer(config_mutex_, private_nh));
@@ -97,8 +96,7 @@ void ResizeNodelet::onInit()
   // Make sure we don't enter connectCb() between advertising and assigning to pub_XXX
   boost::lock_guard<boost::mutex> lock(connect_mutex_);
 
-  pub_image_ = it_->advertise("out_image", 1, connect_cb, connect_cb);
-  pub_info_ = private_nh.advertise<sensor_msgs::CameraInfo>("camera_info", 1);
+  pub_image_ = private_it_->advertiseCamera("image", 1, connect_cb, connect_cb);
 }
 
 // Handles (un)subscribing when clients (un)subscribe
@@ -112,54 +110,13 @@ void ResizeNodelet::connectCb()
   else if (!sub_image_)
   {
     image_transport::TransportHints hints("raw", ros::TransportHints(), getPrivateNodeHandle());
-    sub_image_ = it_->subscribeCamera("in_image", queue_size_, &ResizeNodelet::imageCb, this, hints);
+    sub_image_ = it_->subscribeCamera("image", queue_size_, &ResizeNodelet::imageCb, this, hints);
   }
 }
 
 void ResizeNodelet::configCb(Config &config, uint32_t level)
 {
   config_ = config;
-}
-
-void ResizeNodelet::infoCb(const sensor_msgs::CameraInfoConstPtr& info_msg)
-{
-  Config config;
-  {
-    boost::lock_guard<boost::recursive_mutex> lock(config_mutex_);
-    config = config_;
-  }
-
-  sensor_msgs::CameraInfo dst_info_msg = *info_msg;
-
-  double scale_y;
-  double scale_x;
-  if (config.use_scale)
-  {
-    scale_y = config.scale_height;
-    scale_x = config.scale_width;
-    dst_info_msg.height = static_cast<int>(info_msg->height * config.scale_height);
-    dst_info_msg.width = static_cast<int>(info_msg->width * config.scale_width);
-  }
-  else
-  {
-    scale_y = static_cast<double>(config.height) / info_msg->height;
-    scale_x = static_cast<double>(config.width) / info_msg->width;
-    dst_info_msg.height = config.height;
-    dst_info_msg.width = config.width;
-  }
-
-  dst_info_msg.K[0] = dst_info_msg.K[0] * scale_x;  // fx
-  dst_info_msg.K[2] = dst_info_msg.K[2] * scale_x;  // cx
-  dst_info_msg.K[4] = dst_info_msg.K[4] * scale_y;  // fy
-  dst_info_msg.K[5] = dst_info_msg.K[5] * scale_y;  // cy
-
-  dst_info_msg.P[0] = dst_info_msg.P[0] * scale_x;  // fx
-  dst_info_msg.P[2] = dst_info_msg.P[2] * scale_x;  // cx
-  dst_info_msg.P[3] = dst_info_msg.P[3] * scale_x;  // T
-  dst_info_msg.P[5] = dst_info_msg.P[5] * scale_y;  // fy
-  dst_info_msg.P[6] = dst_info_msg.P[6] * scale_y;  // cy
-
-  pub_info_.publish(dst_info_msg);
 }
 
 void ResizeNodelet::imageCb(const sensor_msgs::ImageConstPtr& image_msg,
@@ -195,9 +152,40 @@ void ResizeNodelet::imageCb(const sensor_msgs::ImageConstPtr& image_msg,
     cv::resize(cv_ptr->image, buffer, cv::Size(width, height), 0, 0, config.interpolation);
   }
 
+  // camera_info
+  sensor_msgs::CameraInfoPtr dst_info_msg(new sensor_msgs::CameraInfo(*info_msg));
+
+  double scale_y;
+  double scale_x;
+  if (config.use_scale)
+  {
+    scale_y = config.scale_height;
+    scale_x = config.scale_width;
+    dst_info_msg->height = static_cast<int>(info_msg->height * config.scale_height);
+    dst_info_msg->width = static_cast<int>(info_msg->width * config.scale_width);
+  }
+  else
+  {
+    scale_y = static_cast<double>(config.height) / info_msg->height;
+    scale_x = static_cast<double>(config.width) / info_msg->width;
+    dst_info_msg->height = config.height;
+    dst_info_msg->width = config.width;
+  }
+
+  dst_info_msg->K[0] = dst_info_msg->K[0] * scale_x;  // fx
+  dst_info_msg->K[2] = dst_info_msg->K[2] * scale_x;  // cx
+  dst_info_msg->K[4] = dst_info_msg->K[4] * scale_y;  // fy
+  dst_info_msg->K[5] = dst_info_msg->K[5] * scale_y;  // cy
+
+  dst_info_msg->P[0] = dst_info_msg->P[0] * scale_x;  // fx
+  dst_info_msg->P[2] = dst_info_msg->P[2] * scale_x;  // cx
+  dst_info_msg->P[3] = dst_info_msg->P[3] * scale_x;  // T
+  dst_info_msg->P[5] = dst_info_msg->P[5] * scale_y;  // fy
+  dst_info_msg->P[6] = dst_info_msg->P[6] * scale_y;  // cy
+
+  // publish
   sensor_msgs::ImagePtr out_msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", buffer).toImageMsg();  
-  pub_image_.publish(out_msg);
-  infoCb(info_msg);
+  pub_image_.publish(out_msg, dst_info_msg);
 }
 
 }  // namespace image_proc
